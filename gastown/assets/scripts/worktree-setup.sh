@@ -231,7 +231,7 @@ lock_holder() {
 take_repo_lock() {
     if [ -d "$1" ] && [ ! -L "$1" ]; then
         echo "worktree-setup: repo lock path $1 is a directory, not a lock; remove it" >&2
-        return 1
+        return 2
     fi
     ln -s "$LOCK_PREFIX$$" "$1" 2>/dev/null || return 1
     [ "$(lock_holder "$1")" = "$$" ]
@@ -242,7 +242,15 @@ acquire_repo_lock() {
     LOCK_PATH="$LOCK_COMMON/gc-worktree-setup.pidlock"
     WAITED=0
     TAKEOVER_BUSY=0
-    while ! take_repo_lock "$LOCK_PATH"; do
+    # Set before taking it: a signal right after ln -s must still release
+    # it. release_repo_lock only removes a lock that names this pid.
+    REPO_LOCK=$LOCK_PATH
+    while :; do
+        TAKE_RC=0
+        take_repo_lock "$LOCK_PATH" || TAKE_RC=$?
+        [ "$TAKE_RC" -eq 0 ] && break
+        # Not a lock we can wait on: fail now instead of after the timeout.
+        [ "$TAKE_RC" -eq 2 ] && return 1
         HOLDER=$(lock_holder "$LOCK_PATH")
         if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2>/dev/null; then
             if mkdir "$LOCK_PATH.takeover" 2>/dev/null; then
