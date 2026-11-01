@@ -34,7 +34,7 @@ hold_lock() {
 }
 
 lock_path() {
-    printf '%s/gc-worktree-setup.lock' "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"
+    printf '%s/gc-worktree-setup.pidlock' "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"
 }
 
 # Many agents of one rig at once: every worktree is created, every branch
@@ -202,6 +202,23 @@ test_term_releases_lock() {
     [ ! -L "$lock" ] || fail "TERM while holding left the repo lock behind"
 }
 
+# A directory at the lock path is never mistaken for a held lock: setup
+# refuses (bounded wait, clear message) instead of linking inside it.
+test_directory_at_lock_path_is_refused() {
+    local base="$1" rig="$1/rig" lock
+    lock=$(lock_path "$rig")
+    mkdir "$lock"
+    if GC_WORKTREE_SETUP_LOCK_WAIT=2 sh "$SCRIPT" "$rig" "$base/wt-dirlock" dirlock 2>"$base/dirlock.log"; then
+        rm -rf "$lock"
+        fail "setup must not run when the lock path is a directory"
+    fi
+    grep -q 'is a directory, not a lock' "$base/dirlock.log" ||
+        { cat "$base/dirlock.log" >&2; fail "directory lock path not reported"; }
+    [ -z "$(ls -A "$lock")" ] || fail "setup linked inside the directory at the lock path"
+    [ ! -e "$base/wt-dirlock/.git" ] || fail "worktree created without the lock"
+    rmdir "$lock"
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 new_upstream_and_rig "$tmp"
@@ -214,5 +231,6 @@ test_failed_add_releases_lock "$tmp"
 test_concurrent_stale_takeover_is_single "$tmp"
 test_leftover_takeover_mutex_is_cleared "$tmp"
 test_term_releases_lock "$tmp"
+test_directory_at_lock_path_is_refused "$tmp"
 
 echo "worktree-setup lock tests passed"

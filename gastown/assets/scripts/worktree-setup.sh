@@ -226,12 +226,23 @@ lock_holder() {
     printf '%s' "${TARGET#"$LOCK_PREFIX"}"
 }
 
+# ln -s into an existing directory "succeeds" by linking inside it; only a
+# symlink at the lock path naming this pid is ownership.
+take_repo_lock() {
+    if [ -d "$1" ] && [ ! -L "$1" ]; then
+        echo "worktree-setup: repo lock path $1 is a directory, not a lock; remove it" >&2
+        return 1
+    fi
+    ln -s "$LOCK_PREFIX$$" "$1" 2>/dev/null || return 1
+    [ "$(lock_holder "$1")" = "$$" ]
+}
+
 acquire_repo_lock() {
     LOCK_COMMON=$(git_common_dir "$RIG_ROOT") || return 0
-    LOCK_PATH="$LOCK_COMMON/gc-worktree-setup.lock"
+    LOCK_PATH="$LOCK_COMMON/gc-worktree-setup.pidlock"
     WAITED=0
     TAKEOVER_BUSY=0
-    while ! ln -s "$LOCK_PREFIX$$" "$LOCK_PATH" 2>/dev/null; do
+    while ! take_repo_lock "$LOCK_PATH"; do
         HOLDER=$(lock_holder "$LOCK_PATH")
         if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2>/dev/null; then
             if mkdir "$LOCK_PATH.takeover" 2>/dev/null; then
@@ -246,11 +257,12 @@ acquire_repo_lock() {
                 TAKEOVER=""
                 continue
             fi
-            # The mutex is held for an instant; seen for ~10 consecutive
-            # seconds means its holder died inside the takeover. Its pid
-            # re-check still guards the lock if this clears a live one.
+            # The mutex is held for an instant (re-check + rm). Seen busy
+            # for ~30 consecutive seconds, its holder is taken as dead and
+            # the mutex cleared. Assumption: no live process stalls 30s
+            # inside that window; if one did, it could remove a fresh lock.
             TAKEOVER_BUSY=$((TAKEOVER_BUSY + 1))
-            if [ "$TAKEOVER_BUSY" -ge 10 ]; then
+            if [ "$TAKEOVER_BUSY" -ge 30 ]; then
                 rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
                 TAKEOVER_BUSY=0
             fi
