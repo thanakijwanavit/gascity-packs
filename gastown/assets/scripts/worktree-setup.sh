@@ -248,10 +248,82 @@ restore_stage() {
     STAGE=""
 }
 
+# Serialize the shared-git-state section (worktree prune, fetch, worktree
+# add) per repository. Pool sessions of one rig start together, and each
+# `git worktree add -b <branch> origin/<default>` writes upstream tracking
+# into the shared .git/config; two at once fail with "could not lock config
+# file .git/config: File exists" and leave the session without a worktree
+# (G1 1 Nov 2026: 9 chat-to-shop-pratham polecats). The lock is an atomic
+# mkdir in the git common dir (portable: no flock on macOS) holding the
+# holder's pid, so a holder that was SIGKILLed is detected and replaced.
+REPO_LOCK=""
+REPO_LOCK_WAIT=${GC_WORKTREE_SETUP_LOCK_WAIT:-180}
+
+acquire_repo_lock() {
+    LOCK_COMMON=$(git_common_dir "$RIG_ROOT") || return 0
+    LOCK_PATH="$LOCK_COMMON/gc-worktree-setup.lock"
+    WAITED=0
+    EMPTY_PID_CHECKS=0
+    while ! mkdir "$LOCK_PATH" 2>/dev/null; do
+        HOLDER=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
+        if [ -z "$HOLDER" ]; then
+            # The holder writes its pid right after mkdir; an empty pid that
+            # persists means it died in between.
+            EMPTY_PID_CHECKS=$((EMPTY_PID_CHECKS + 1))
+        else
+            EMPTY_PID_CHECKS=0
+        fi
+        if { [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2>/dev/null; } ||
+            [ "$EMPTY_PID_CHECKS" -ge 10 ]; then
+            # Stale: move it aside (atomic) only if it still names the dead
+            # holder, so two waiters never remove each other's fresh lock.
+            NOW_HOLDER=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
+            if [ "$NOW_HOLDER" = "$HOLDER" ] &&
+                mv "$LOCK_PATH" "$LOCK_PATH.stale.$$" 2>/dev/null; then
+                rm -rf "$LOCK_PATH.stale.$$"
+                echo "worktree-setup: removed stale repo lock (pid ${HOLDER:-none}) at $LOCK_PATH" >&2
+            fi
+            EMPTY_PID_CHECKS=0
+            continue
+        fi
+        if [ "$WAITED" -ge "$REPO_LOCK_WAIT" ]; then
+            echo "worktree-setup: timed out after ${WAITED}s waiting for repo lock $LOCK_PATH (pid ${HOLDER:-unknown})" >&2
+            return 1
+        fi
+        # Print while waiting: gc's pre_start idle budget ends a silent step.
+        if [ $((WAITED % 10)) -eq 0 ]; then
+            echo "worktree-setup: waiting for repo lock $LOCK_PATH (pid ${HOLDER:-unknown}, ${WAITED}s)" >&2
+        fi
+        sleep 1
+        WAITED=$((WAITED + 1))
+    done
+    echo "$$" > "$LOCK_PATH/pid"
+    REPO_LOCK=$LOCK_PATH
+}
+
+release_repo_lock() {
+    [ -n "$REPO_LOCK" ] || return 0
+    if [ "$(cat "$REPO_LOCK/pid" 2>/dev/null || true)" = "$$" ]; then
+        rm -rf "$REPO_LOCK"
+    fi
+    REPO_LOCK=""
+}
+
+cleanup_setup() {
+    restore_stage
+    release_repo_lock
+}
+
 if [ -d "$WT" ] && [ "$(find "$WT" -mindepth 1 -maxdepth 1 | head -n 1)" ]; then
     STAGE=$(mktemp -d "$(dirname "$WT")/.gascity-worktree-stage.XXXXXX")
     find "$WT" -mindepth 1 -maxdepth 1 -exec mv {} "$STAGE"/ \;
-    trap 'restore_stage' EXIT HUP INT TERM
+fi
+trap 'cleanup_setup' EXIT
+trap 'cleanup_setup; exit 1' HUP INT TERM
+
+if ! acquire_repo_lock; then
+    restore_stage
+    exit 1
 fi
 
 rmdir "$WT" 2>/dev/null || true
@@ -308,6 +380,7 @@ if [ -n "$STAGE" ]; then
     rm -rf "$STAGE"
     STAGE=""
 fi
+release_repo_lock
 trap - EXIT HUP INT TERM
 
 # Bead redirect for filesystem beads.
