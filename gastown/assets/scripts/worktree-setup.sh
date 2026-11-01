@@ -218,6 +218,7 @@ acquire_repo_lock() {
     LOCK_PATH="$LOCK_COMMON/gc-worktree-setup.lock"
     WAITED=0
     EMPTY_PID_CHECKS=0
+    TAKEOVER_CHECKS=0
     while ! mkdir "$LOCK_PATH" 2>/dev/null; do
         HOLDER=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
         if [ -z "$HOLDER" ]; then
@@ -229,15 +230,29 @@ acquire_repo_lock() {
         fi
         if { [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2>/dev/null; } ||
             [ "$EMPTY_PID_CHECKS" -ge 10 ]; then
-            # Stale: move it aside (atomic) only if it still names the dead
-            # holder, so two waiters never remove each other's fresh lock.
-            NOW_HOLDER=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
-            if [ "$NOW_HOLDER" = "$HOLDER" ] &&
-                mv "$LOCK_PATH" "$LOCK_PATH.stale.$$" 2>/dev/null; then
-                rm -rf "$LOCK_PATH.stale.$$"
-                echo "worktree-setup: removed stale repo lock (pid ${HOLDER:-none}) at $LOCK_PATH" >&2
-                EMPTY_PID_CHECKS=0
-                continue
+            # Stale: remove it under a takeover mutex (atomic mkdir), and
+            # only if it still names the holder seen dead, so two waiters
+            # never remove each other's fresh lock: the re-check and the
+            # removal cannot interleave with another takeover.
+            if mkdir "$LOCK_PATH.takeover" 2>/dev/null; then
+                TAKEOVER_CHECKS=0
+                NOW_HOLDER=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
+                if [ -d "$LOCK_PATH" ] && [ "$NOW_HOLDER" = "$HOLDER" ]; then
+                    rm -rf "$LOCK_PATH"
+                    rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
+                    echo "worktree-setup: removed stale repo lock (pid ${HOLDER:-none}) at $LOCK_PATH" >&2
+                    EMPTY_PID_CHECKS=0
+                    continue
+                fi
+                rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
+            else
+                # A takeover holder killed mid-takeover leaves the mutex;
+                # it lives for microseconds, so one older than ~10s is dead.
+                TAKEOVER_CHECKS=$((TAKEOVER_CHECKS + 1))
+                if [ "$TAKEOVER_CHECKS" -ge 10 ]; then
+                    rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
+                    TAKEOVER_CHECKS=0
+                fi
             fi
             # Another waiter took over or the holder changed: back off and
             # count the wait so this path cannot spin past the timeout.

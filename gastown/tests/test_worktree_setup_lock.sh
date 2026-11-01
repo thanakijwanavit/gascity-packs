@@ -129,6 +129,32 @@ test_failed_add_releases_lock() {
     [ ! -e "$lock" ] || fail "repo lock left behind after failed worktree add"
 }
 
+# Many waiters see the same dead holder at once: exactly one removes the
+# stale lock (takeover mutex), no fresh lock is removed, and all succeed.
+test_concurrent_stale_takeover_is_single() {
+    local base="$1" rig="$1/rig" lock dead n=6 i pids=() rc=0
+    lock=$(lock_path "$rig")
+    sh -c 'exit 0' &
+    dead=$!
+    wait "$dead"
+    mkdir "$lock"
+    echo "$dead" >"$lock/pid"
+    for i in $(seq 1 "$n"); do
+        GC_WORKTREE_SETUP_LOCK_WAIT=60 sh "$SCRIPT" "$rig" "$base/wt-cst-$i" "cst$i" >"$base/cst-$i.log" 2>&1 &
+        pids+=("$!")
+    done
+    for i in "${!pids[@]}"; do
+        wait "${pids[$i]}" || { rc=1; cat "$base/cst-$((i + 1)).log" >&2; }
+    done
+    [ "$rc" = 0 ] || fail "concurrent setups after a stale lock failed"
+    [ "$(cat "$base"/cst-*.log | grep -c 'removed stale repo lock')" = 1 ] ||
+        fail "stale lock must be taken over exactly once"
+    for i in $(seq 1 "$n"); do
+        [ -f "$base/wt-cst-$i/.git" ] || fail "worktree cst$i missing"
+    done
+    [ ! -e "$lock" ] && [ ! -e "$lock.takeover" ] || fail "lock or takeover mutex left behind"
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 new_upstream_and_rig "$tmp"
@@ -138,5 +164,6 @@ test_stale_lock_from_dead_holder_is_replaced "$tmp"
 test_live_lock_times_out_cleanly "$tmp"
 test_sync_existing_worktree_uses_lock "$tmp"
 test_failed_add_releases_lock "$tmp"
+test_concurrent_stale_takeover_is_single "$tmp"
 
 echo "worktree-setup lock tests passed"
