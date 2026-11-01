@@ -90,6 +90,45 @@ test_live_lock_times_out_cleanly() {
     rm -rf "$lock"
 }
 
+# --sync on an existing worktree writes shared git state too (fetch,
+# checkout -b with tracking), so it waits for the repo lock; with the lock
+# free it syncs and releases it.
+test_sync_existing_worktree_uses_lock() {
+    local base="$1" rig="$1/rig" lock holder
+    lock=$(lock_path "$rig")
+    sh "$SCRIPT" "$rig" "$base/wt-sync" syncer >/dev/null 2>&1 || fail "initial setup for sync test failed"
+    sleep 30 &
+    holder=$!
+    mkdir "$lock"
+    echo "$holder" >"$lock/pid"
+    if GC_WORKTREE_SETUP_LOCK_WAIT=2 sh "$SCRIPT" "$rig" "$base/wt-sync" syncer --sync 2>"$base/sync-held.log"; then
+        kill "$holder" 2>/dev/null || true
+        fail "--sync should wait for a live holder's lock"
+    fi
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    grep -q 'timed out after 2s waiting for repo lock' "$base/sync-held.log" ||
+        { cat "$base/sync-held.log" >&2; fail "--sync did not wait on the repo lock"; }
+    rm -rf "$lock"
+    sh "$SCRIPT" "$rig" "$base/wt-sync" syncer --sync 2>"$base/sync.log" ||
+        { cat "$base/sync.log" >&2; fail "--sync with a free lock failed"; }
+    [ ! -e "$lock" ] || fail "repo lock left behind after --sync"
+}
+
+# A failed worktree add exits non-zero and still releases the lock.
+test_failed_add_releases_lock() {
+    local base="$1" rig="$1/rig" lock
+    lock=$(lock_path "$rig")
+    # Target path is a regular file: git worktree add refuses it.
+    : >"$base/wt-file"
+    if sh "$SCRIPT" "$rig" "$base/wt-file" filetarget 2>"$base/fileadd.log"; then
+        fail "worktree add onto a regular file should fail"
+    fi
+    grep -q 'failed to create worktree' "$base/fileadd.log" ||
+        { cat "$base/fileadd.log" >&2; fail "expected worktree add failure"; }
+    [ ! -e "$lock" ] || fail "repo lock left behind after failed worktree add"
+}
+
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 new_upstream_and_rig "$tmp"
@@ -97,5 +136,7 @@ new_upstream_and_rig "$tmp"
 test_concurrent_setups_all_succeed "$tmp"
 test_stale_lock_from_dead_holder_is_replaced "$tmp"
 test_live_lock_times_out_cleanly "$tmp"
+test_sync_existing_worktree_uses_lock "$tmp"
+test_failed_add_releases_lock "$tmp"
 
 echo "worktree-setup lock tests passed"
