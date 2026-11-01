@@ -203,60 +203,59 @@ install_local_excludes() {
 }
 
 # Serialize the shared-git-state section (worktree prune, fetch, worktree
-# add, --sync branch setup) per repository. Pool sessions of one rig start together, and each
-# `git worktree add -b <branch> origin/<default>` writes upstream tracking
-# into the shared .git/config; two at once fail with "could not lock config
-# file .git/config: File exists" and leave the session without a worktree
-# (G1 1 Nov 2026: 9 chat-to-shop-pratham polecats). The lock is an atomic
-# mkdir in the git common dir (portable: no flock on macOS) holding the
-# holder's pid, so a holder that was SIGKILLed is detected and replaced.
+# add, --sync branch setup) per repository. Pool sessions of one rig start
+# together, and each `git worktree add -b <branch> origin/<default>` writes
+# upstream tracking into the shared .git/config; two at once fail with
+# "could not lock config file .git/config: File exists" and leave the
+# session without a worktree (G1 1 Nov 2026: 9 chat-to-shop-pratham
+# polecats).
+#
+# The lock is a symlink in the git common dir whose target names the
+# holder's pid. `ln -s` creates it atomically with the pid already in it
+# (portable: no flock on macOS), so there is no "lock without owner" state
+# to misread. A holder that was SIGKILLed is detected by its dead pid and
+# replaced; the re-check and removal run under a takeover mutex so two
+# waiters never remove each other's fresh lock.
 REPO_LOCK=""
+TAKEOVER=""
 REPO_LOCK_WAIT=${GC_WORKTREE_SETUP_LOCK_WAIT:-180}
+LOCK_PREFIX="gc-worktree-setup-pid-"
+
+lock_holder() {
+    TARGET=$(readlink "$1" 2>/dev/null) || return 0
+    printf '%s' "${TARGET#"$LOCK_PREFIX"}"
+}
 
 acquire_repo_lock() {
     LOCK_COMMON=$(git_common_dir "$RIG_ROOT") || return 0
     LOCK_PATH="$LOCK_COMMON/gc-worktree-setup.lock"
     WAITED=0
-    EMPTY_PID_CHECKS=0
-    TAKEOVER_CHECKS=0
-    while ! mkdir "$LOCK_PATH" 2>/dev/null; do
-        HOLDER=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
-        if [ -z "$HOLDER" ]; then
-            # The holder writes its pid right after mkdir; an empty pid that
-            # persists means it died in between.
-            EMPTY_PID_CHECKS=$((EMPTY_PID_CHECKS + 1))
-        else
-            EMPTY_PID_CHECKS=0
-        fi
-        if { [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2>/dev/null; } ||
-            [ "$EMPTY_PID_CHECKS" -ge 10 ]; then
-            # Stale: remove it under a takeover mutex (atomic mkdir), and
-            # only if it still names the holder seen dead, so two waiters
-            # never remove each other's fresh lock: the re-check and the
-            # removal cannot interleave with another takeover.
+    TAKEOVER_BUSY=0
+    while ! ln -s "$LOCK_PREFIX$$" "$LOCK_PATH" 2>/dev/null; do
+        HOLDER=$(lock_holder "$LOCK_PATH")
+        if [ -n "$HOLDER" ] && ! kill -0 "$HOLDER" 2>/dev/null; then
             if mkdir "$LOCK_PATH.takeover" 2>/dev/null; then
-                TAKEOVER_CHECKS=0
-                NOW_HOLDER=$(cat "$LOCK_PATH/pid" 2>/dev/null || true)
-                if [ -d "$LOCK_PATH" ] && [ "$NOW_HOLDER" = "$HOLDER" ]; then
-                    rm -rf "$LOCK_PATH"
-                    rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
-                    echo "worktree-setup: removed stale repo lock (pid ${HOLDER:-none}) at $LOCK_PATH" >&2
-                    EMPTY_PID_CHECKS=0
-                    continue
+                TAKEOVER="$LOCK_PATH.takeover"
+                TAKEOVER_BUSY=0
+                # Only the lock still naming the dead holder is removed.
+                if [ "$(lock_holder "$LOCK_PATH")" = "$HOLDER" ]; then
+                    rm -f "$LOCK_PATH"
+                    echo "worktree-setup: removed stale repo lock (pid $HOLDER) at $LOCK_PATH" >&2
                 fi
-                rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
-            else
-                # A takeover holder killed mid-takeover leaves the mutex;
-                # it lives for microseconds, so one older than ~10s is dead.
-                TAKEOVER_CHECKS=$((TAKEOVER_CHECKS + 1))
-                if [ "$TAKEOVER_CHECKS" -ge 10 ]; then
-                    rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
-                    TAKEOVER_CHECKS=0
-                fi
+                rmdir "$TAKEOVER" 2>/dev/null || true
+                TAKEOVER=""
+                continue
             fi
-            # Another waiter took over or the holder changed: back off and
-            # count the wait so this path cannot spin past the timeout.
-            EMPTY_PID_CHECKS=0
+            # The mutex is held for an instant; seen for ~10 consecutive
+            # seconds means its holder died inside the takeover. Its pid
+            # re-check still guards the lock if this clears a live one.
+            TAKEOVER_BUSY=$((TAKEOVER_BUSY + 1))
+            if [ "$TAKEOVER_BUSY" -ge 10 ]; then
+                rmdir "$LOCK_PATH.takeover" 2>/dev/null || true
+                TAKEOVER_BUSY=0
+            fi
+        else
+            TAKEOVER_BUSY=0
         fi
         if [ "$WAITED" -ge "$REPO_LOCK_WAIT" ]; then
             echo "worktree-setup: timed out after ${WAITED}s waiting for repo lock $LOCK_PATH (pid ${HOLDER:-unknown})" >&2
@@ -269,14 +268,17 @@ acquire_repo_lock() {
         sleep 1
         WAITED=$((WAITED + 1))
     done
-    echo "$$" > "$LOCK_PATH/pid"
     REPO_LOCK=$LOCK_PATH
 }
 
 release_repo_lock() {
+    if [ -n "$TAKEOVER" ]; then
+        rmdir "$TAKEOVER" 2>/dev/null || true
+        TAKEOVER=""
+    fi
     [ -n "$REPO_LOCK" ] || return 0
-    if [ "$(cat "$REPO_LOCK/pid" 2>/dev/null || true)" = "$$" ]; then
-        rm -rf "$REPO_LOCK"
+    if [ "$(lock_holder "$REPO_LOCK")" = "$$" ]; then
+        rm -f "$REPO_LOCK"
     fi
     REPO_LOCK=""
 }

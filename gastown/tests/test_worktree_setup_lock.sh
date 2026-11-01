@@ -28,6 +28,11 @@ new_upstream_and_rig() {
     git_c clone -q "$base/upstream.git" "$base/rig"
 }
 
+# The lock is a symlink whose target names the holder pid.
+hold_lock() {
+    ln -s "gc-worktree-setup-pid-$2" "$1"
+}
+
 lock_path() {
     printf '%s/gc-worktree-setup.lock' "$(git -C "$1" rev-parse --path-format=absolute --git-common-dir)"
 }
@@ -59,13 +64,12 @@ test_stale_lock_from_dead_holder_is_replaced() {
     sh -c 'exit 0' &
     dead=$!
     wait "$dead"
-    mkdir "$lock"
-    echo "$dead" >"$lock/pid"
+    hold_lock "$lock" "$dead"
     GC_WORKTREE_SETUP_LOCK_WAIT=5 sh "$SCRIPT" "$rig" "$base/wt-stale" stale 2>"$base/stale.log" ||
         { cat "$base/stale.log" >&2; fail "setup should take over a stale lock"; }
     grep -q 'removed stale repo lock' "$base/stale.log" || fail "stale lock takeover was not reported"
     [ -f "$base/wt-stale/.git" ] || fail "worktree missing after stale-lock takeover"
-    [ ! -e "$lock" ] || fail "repo lock left behind after stale-lock takeover"
+    [ ! -L "$lock" ] || fail "repo lock left behind after stale-lock takeover"
 }
 
 # A live holder is waited on, and the wait is bounded with a clear error;
@@ -75,8 +79,7 @@ test_live_lock_times_out_cleanly() {
     lock=$(lock_path "$rig")
     sleep 30 &
     holder=$!
-    mkdir "$lock"
-    echo "$holder" >"$lock/pid"
+    hold_lock "$lock" "$holder"
     if GC_WORKTREE_SETUP_LOCK_WAIT=2 sh "$SCRIPT" "$rig" "$base/wt-live" live 2>"$base/live.log"; then
         kill "$holder" 2>/dev/null || true
         fail "setup should fail while a live holder keeps the lock"
@@ -85,9 +88,9 @@ test_live_lock_times_out_cleanly() {
     wait "$holder" 2>/dev/null || true
     grep -q 'timed out after 2s waiting for repo lock' "$base/live.log" ||
         { cat "$base/live.log" >&2; fail "timeout message missing"; }
-    [ "$(cat "$lock/pid")" = "$holder" ] || fail "waiter must not remove a live holder's lock"
+    [ "$(readlink "$lock")" = "gc-worktree-setup-pid-$holder" ] || fail "waiter must not remove a live holder's lock"
     [ ! -e "$base/wt-live/.git" ] || fail "no worktree should be created without the lock"
-    rm -rf "$lock"
+    rm -f "$lock"
 }
 
 # --sync on an existing worktree writes shared git state too (fetch,
@@ -99,8 +102,7 @@ test_sync_existing_worktree_uses_lock() {
     sh "$SCRIPT" "$rig" "$base/wt-sync" syncer >/dev/null 2>&1 || fail "initial setup for sync test failed"
     sleep 30 &
     holder=$!
-    mkdir "$lock"
-    echo "$holder" >"$lock/pid"
+    hold_lock "$lock" "$holder"
     if GC_WORKTREE_SETUP_LOCK_WAIT=2 sh "$SCRIPT" "$rig" "$base/wt-sync" syncer --sync 2>"$base/sync-held.log"; then
         kill "$holder" 2>/dev/null || true
         fail "--sync should wait for a live holder's lock"
@@ -109,10 +111,10 @@ test_sync_existing_worktree_uses_lock() {
     wait "$holder" 2>/dev/null || true
     grep -q 'timed out after 2s waiting for repo lock' "$base/sync-held.log" ||
         { cat "$base/sync-held.log" >&2; fail "--sync did not wait on the repo lock"; }
-    rm -rf "$lock"
+    rm -f "$lock"
     sh "$SCRIPT" "$rig" "$base/wt-sync" syncer --sync 2>"$base/sync.log" ||
         { cat "$base/sync.log" >&2; fail "--sync with a free lock failed"; }
-    [ ! -e "$lock" ] || fail "repo lock left behind after --sync"
+    [ ! -L "$lock" ] || fail "repo lock left behind after --sync"
 }
 
 # A failed worktree add exits non-zero and still releases the lock.
@@ -126,7 +128,7 @@ test_failed_add_releases_lock() {
     fi
     grep -q 'failed to create worktree' "$base/fileadd.log" ||
         { cat "$base/fileadd.log" >&2; fail "expected worktree add failure"; }
-    [ ! -e "$lock" ] || fail "repo lock left behind after failed worktree add"
+    [ ! -L "$lock" ] || fail "repo lock left behind after failed worktree add"
 }
 
 # Many waiters see the same dead holder at once: exactly one removes the
@@ -137,8 +139,7 @@ test_concurrent_stale_takeover_is_single() {
     sh -c 'exit 0' &
     dead=$!
     wait "$dead"
-    mkdir "$lock"
-    echo "$dead" >"$lock/pid"
+    hold_lock "$lock" "$dead"
     for i in $(seq 1 "$n"); do
         GC_WORKTREE_SETUP_LOCK_WAIT=60 sh "$SCRIPT" "$rig" "$base/wt-cst-$i" "cst$i" >"$base/cst-$i.log" 2>&1 &
         pids+=("$!")
@@ -152,7 +153,53 @@ test_concurrent_stale_takeover_is_single() {
     for i in $(seq 1 "$n"); do
         [ -f "$base/wt-cst-$i/.git" ] || fail "worktree cst$i missing"
     done
-    [ ! -e "$lock" ] && [ ! -e "$lock.takeover" ] || fail "lock or takeover mutex left behind"
+    [ ! -L "$lock" ] && [ ! -e "$lock.takeover" ] || fail "lock or takeover mutex left behind"
+}
+
+# A takeover mutex left by a holder killed mid-takeover does not wedge
+# waiters: it is cleared and the stale lock is still replaced.
+test_leftover_takeover_mutex_is_cleared() {
+    local base="$1" rig="$1/rig" lock dead
+    lock=$(lock_path "$rig")
+    sh -c 'exit 0' &
+    dead=$!
+    wait "$dead"
+    hold_lock "$lock" "$dead"
+    mkdir "$lock.takeover"
+    GC_WORKTREE_SETUP_LOCK_WAIT=60 sh "$SCRIPT" "$rig" "$base/wt-mutex" mutex 2>"$base/mutex.log" ||
+        { cat "$base/mutex.log" >&2; fail "setup should clear a leftover takeover mutex"; }
+    [ -f "$base/wt-mutex/.git" ] || fail "worktree missing after leftover mutex"
+    [ ! -e "$lock" ] && [ ! -L "$lock" ] && [ ! -e "$lock.takeover" ] || fail "lock or mutex left behind"
+}
+
+# SIGTERM while waiting for the lock exits non-zero and leaves the live
+# holder's lock alone; SIGTERM while holding it releases it.
+test_term_releases_lock() {
+    local base="$1" rig="$1/rig" lock holder waiter
+    lock=$(lock_path "$rig")
+    sleep 30 &
+    holder=$!
+    hold_lock "$lock" "$holder"
+    GC_WORKTREE_SETUP_LOCK_WAIT=60 sh "$SCRIPT" "$rig" "$base/wt-term" term 2>"$base/term.log" &
+    waiter=$!
+    sleep 2
+    kill -TERM "$waiter"
+    if wait "$waiter"; then fail "TERMed waiter should exit non-zero"; fi
+    [ "$(readlink "$lock")" = "gc-worktree-setup-pid-$holder" ] || fail "TERMed waiter touched the holder's lock"
+    kill "$holder" 2>/dev/null || true
+    wait "$holder" 2>/dev/null || true
+    rm -f "$lock"
+    # Holding: block the script inside the locked section with a slow git.
+    mkdir -p "$base/slowbin"
+    printf '#!/bin/sh\ncase "$*" in *"worktree add"*) sleep 5;; esac\nexec %s "$@"\n' "$(command -v git)" >"$base/slowbin/git"
+    chmod +x "$base/slowbin/git"
+    PATH="$base/slowbin:$PATH" sh "$SCRIPT" "$rig" "$base/wt-term2" term2 2>"$base/term2.log" &
+    waiter=$!
+    for _ in $(seq 1 50); do [ -L "$lock" ] && break; sleep 0.2; done
+    [ -L "$lock" ] || fail "setup never took the lock"
+    kill -TERM "$waiter"
+    wait "$waiter" 2>/dev/null || true
+    [ ! -L "$lock" ] || fail "TERM while holding left the repo lock behind"
 }
 
 tmp=$(mktemp -d)
@@ -165,5 +212,7 @@ test_live_lock_times_out_cleanly "$tmp"
 test_sync_existing_worktree_uses_lock "$tmp"
 test_failed_add_releases_lock "$tmp"
 test_concurrent_stale_takeover_is_single "$tmp"
+test_leftover_takeover_mutex_is_cleared "$tmp"
+test_term_releases_lock "$tmp"
 
 echo "worktree-setup lock tests passed"
